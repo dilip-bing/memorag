@@ -1,0 +1,46 @@
+llm:
+  model: "qwen3.5:9b-q4_K_M"
+  base_url: "http://localhost:11434"
+  request_timeout: 300.0
+  temperature: 0.6
+  context_window: 32768
+
+embedding:
+  model: "nomic-embed-text"
+  base_url: "http://localhost:11434"
+  embed_batch_size: 10
+
+chroma:
+  persist_dir: "storage/chroma"
+  default_collection: "documents"
+  distance_metric: "cosine"
+
+storage:
+  docstore_dir: "storage/docstore"
+  ingestion_cache_dir: "storage/ingestion_cache"
+  data_dir: "data"
+
+ingestion:
+  chunk_size: 512
+  chunk_overlap: 64
+  supported_extensions: [".pdf", ".txt", ".docx", ".md", ".csv"]
+  recursive: true
+  num_workers: 2
+
+retrieval:
+  mode: "hybrid"
+  similarity_top_k: 5
+  bm25_top_k: 5
+  fusion_mode: "reciprocal_rerank"
+  num_queries: 1
+  similarity_cutoff: 0.1
+
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  max_bytes: 10485760
+  backup_count: 5
+  use_rich_console: true
+
+auth:
+  api_key: "your-secret-api-key-here"
