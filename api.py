@@ -189,6 +189,7 @@ async def query(request: QueryRequest):
                 collection=request.collection,
                 top_k=request.top_k,
                 thinking=request.thinking,
+                model=request.model,
             )
             tasks[task_id]["result"] = QueryResponse(
                 question=result.question,
@@ -382,6 +383,30 @@ async def delete_collection(name: str):
         return {"status": "deleted", "collection": name}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@protected.get("/models", tags=["System"])
+async def list_models():
+    """List all models available in Ollama."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{settings.llm.base_url}/api/tags")
+            r.raise_for_status()
+            data = r.json()
+            models = [
+                {
+                    "name": m["name"],
+                    "size": m.get("size", 0),
+                    "modified_at": m.get("modified_at", ""),
+                }
+                for m in data.get("models", [])
+            ]
+            return {
+                "models": models,
+                "active_model": settings.llm.model,
+            }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach Ollama: {exc}")
 
 
 app.include_router(protected)
