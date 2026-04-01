@@ -1,7 +1,7 @@
 llm:
   model: "qwen3.5:9b-q4_K_M"
   base_url: "http://localhost:11434"
-  request_timeout: 300.0
+  request_timeout: 600.0
   temperature: 0.6
   context_window: 32768
 
