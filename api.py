@@ -7,10 +7,13 @@ Local RAG API Server
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Any
 
 import httpx
 import uvicorn
@@ -32,6 +35,8 @@ from rag.models.responses import (
     CollectionStatsResponse,
     HealthResponse,
     SourceNodeModel,
+    TaskSubmittedResponse,
+    TaskStatusResponse,
 )
 
 setup_logging(settings)
@@ -61,6 +66,9 @@ class AppState:
 
 
 state = AppState()
+
+# ── Task store for async queries ──────────────────────────────────────────
+tasks: Dict[str, Dict[str, Any]] = {}
 
 
 # ── Lifespan (replaces deprecated on_event) ────────────────────────────────
@@ -163,38 +171,57 @@ async def get_config():
     }
 
 
-# ── Query endpoint ─────────────────────────────────────────────────────────
+# ── Query endpoints (async task-based) ─────────────────────────────────────
 
-@protected.post("/query", response_model=QueryResponse, tags=["RAG"])
+@protected.post("/query", response_model=TaskSubmittedResponse, tags=["RAG"])
 async def query(request: QueryRequest):
     """
-    Ask a question — the RAG pipeline retrieves relevant context
-    from your documents and generates a grounded answer.
+    Submit a RAG query. Returns a task_id immediately.
+    Poll GET /query/{task_id} for the result.
     """
-    try:
-        result = await state.engine.aquery(
-            question=request.question,
-            collection=request.collection,
-            top_k=request.top_k,
-            thinking=request.thinking,
-        )
-        return QueryResponse(
-            question=result.question,
-            answer=result.answer,
-            sources=[
-                SourceNodeModel(
-                    text=s.text,
-                    score=s.score,
-                    metadata=s.metadata,
-                )
-                for s in result.sources
-            ],
-            collection=result.collection,
-            elapsed_seconds=result.elapsed_seconds,
-        )
-    except Exception as exc:
-        logger.error(f"Query error: {exc}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {"status": "processing", "result": None, "error": None}
+
+    async def _run():
+        try:
+            result = await state.engine.aquery(
+                question=request.question,
+                collection=request.collection,
+                top_k=request.top_k,
+                thinking=request.thinking,
+            )
+            tasks[task_id]["result"] = QueryResponse(
+                question=result.question,
+                answer=result.answer,
+                sources=[
+                    SourceNodeModel(text=s.text, score=s.score, metadata=s.metadata)
+                    for s in result.sources
+                ],
+                collection=result.collection,
+                elapsed_seconds=result.elapsed_seconds,
+            )
+            tasks[task_id]["status"] = "completed"
+        except Exception as exc:
+            logger.error(f"Query error: {exc}", exc_info=True)
+            tasks[task_id]["status"] = "error"
+            tasks[task_id]["error"] = str(exc)
+
+    asyncio.create_task(_run())
+    return TaskSubmittedResponse(task_id=task_id)
+
+
+@protected.get("/query/{task_id}", response_model=TaskStatusResponse, tags=["RAG"])
+async def query_status(task_id: str):
+    """Poll this endpoint for query results."""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = tasks[task_id]
+    return TaskStatusResponse(
+        task_id=task_id,
+        status=task["status"],
+        result=task["result"],
+        error=task["error"],
+    )
 
 
 # ── Ingest endpoints ───────────────────────────────────────────────────────

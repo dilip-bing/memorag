@@ -1,6 +1,6 @@
 """API response models."""
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 
 
@@ -16,6 +16,18 @@ class QueryResponse(BaseModel):
     sources: List[SourceNodeModel]
     collection: str
     elapsed_seconds: float
+
+
+class TaskSubmittedResponse(BaseModel):
+    task_id: str
+    status: str = "processing"
+
+
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: str  # processing | completed | error
+    result: Optional[QueryResponse] = None
+    error: Optional[str] = None
 
 
 class IngestResponse(BaseModel):
