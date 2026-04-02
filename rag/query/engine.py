@@ -62,11 +62,24 @@ class RAGQueryEngine:
         Settings.llm = self._llm_fast  # default to fast
         logger.info(f"Query engine ready - LLM: {config.llm.model}")
 
-    def query(self, question: str, collection: str = "documents", top_k: Optional[int] = None, thinking: bool = True) -> QueryResult:
+    def _get_llm(self, thinking: bool, model: Optional[str] = None) -> Ollama:
+        """Return the right LLM instance. Creates a new one if model is overridden."""
+        if model and model != self.config.llm.model:
+            return Ollama(
+                model=model,
+                base_url=self.config.llm.base_url,
+                request_timeout=self.config.llm.request_timeout * (3 if thinking else 1),
+                temperature=self.config.llm.temperature,
+                context_window=self.config.llm.context_window,
+                thinking=thinking,
+            )
+        return self._llm_think if thinking else self._llm_fast
+
+    def query(self, question: str, collection: str = "documents", top_k: Optional[int] = None, thinking: bool = True, model: Optional[str] = None) -> QueryResult:
         """Synchronous RAG query."""
         start = time.time()
         try:
-            engine = self._get_engine(collection, top_k, thinking)
+            engine = self._get_engine(collection, top_k, thinking, model)
             response = engine.query(question)
             sources = [
                 SourceNode(
@@ -86,11 +99,11 @@ class RAGQueryEngine:
         except Exception as exc:
             raise LLMError(f"Query failed: {exc}") from exc
 
-    async def aquery(self, question: str, collection: str = "documents", top_k: Optional[int] = None, thinking: bool = True) -> QueryResult:
+    async def aquery(self, question: str, collection: str = "documents", top_k: Optional[int] = None, thinking: bool = True, model: Optional[str] = None) -> QueryResult:
         """Async RAG query — use this from FastAPI."""
         start = time.time()
         try:
-            engine = self._get_engine(collection, top_k, thinking)
+            engine = self._get_engine(collection, top_k, thinking, model)
             response = await engine.aquery(question)
             sources = [
                 SourceNode(
@@ -110,8 +123,9 @@ class RAGQueryEngine:
         except Exception as exc:
             raise LLMError(f"Async query failed: {exc}") from exc
 
-    def _get_engine(self, collection: str, top_k: Optional[int] = None, thinking: bool = True) -> RetrieverQueryEngine:
-        cache_key = f"{collection}:{top_k}:{'think' if thinking else 'fast'}"
+    def _get_engine(self, collection: str, top_k: Optional[int] = None, thinking: bool = True, model: Optional[str] = None) -> RetrieverQueryEngine:
+        model_key = model or self.config.llm.model
+        cache_key = f"{collection}:{top_k}:{'think' if thinking else 'fast'}:{model_key}"
         if cache_key in self._engines:
             return self._engines[cache_key]
 
@@ -131,7 +145,7 @@ class RAGQueryEngine:
         postprocessors = [
             SimilarityPostprocessor(similarity_cutoff=cfg.similarity_cutoff)
         ]
-        llm = self._llm_think if thinking else self._llm_fast
+        llm = self._get_llm(thinking, model)
         engine = RetrieverQueryEngine.from_args(
             retriever=retriever,
             node_postprocessors=postprocessors,

@@ -16,6 +16,7 @@ class QueryRequest(BaseModel):
     collection: str = Field("documents", description="ChromaDB collection to query")
     top_k: Optional[int] = Field(None, description="Override retrieval top_k")
     thinking: bool = Field(True, description="Enable thinking/reasoning (slower but better). Set false for fast answers.")
+    model: Optional[str] = Field(None, description="Override LLM model (e.g. 'llama3.1:latest')")
 
 
 class CollectionRequest(BaseModel):
