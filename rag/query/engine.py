@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, AsyncGenerator
 
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.postprocessor import SimilarityPostprocessor
@@ -123,6 +123,68 @@ class RAGQueryEngine:
         except Exception as exc:
             raise LLMError(f"Async query failed: {exc}") from exc
 
+    async def aquery_stream(
+        self,
+        question: str,
+        collection: str = "documents",
+        top_k: Optional[int] = None,
+        thinking: bool = True,
+        model: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream RAG query with status updates and tokens."""
+        start = time.time()
+        try:
+            # Status: Starting
+            status_label = "Thinking" if thinking else "Fast thinking"
+            yield {"type": "status", "status": status_label, "phase": "retrieving"}
+
+            # Get engine and retrieve
+            engine = self._get_engine(collection, top_k, thinking, model)
+            
+            # Status: Retrieved
+            yield {"type": "status", "status": status_label, "phase": "generating"}
+
+            # Stream the response
+            streaming_response = await engine.aquery(question)
+            
+            # Extract sources
+            sources = [
+                SourceNode(
+                    text=n.node.get_content()[:500],
+                    score=round(n.score or 0.0, 4),
+                    metadata=n.node.metadata,
+                )
+                for n in (streaming_response.source_nodes or [])
+            ]
+
+            # Send answer as complete (LlamaIndex doesn't expose token streaming easily)
+            answer = str(streaming_response)
+            yield {
+                "type": "answer",
+                "content": answer,
+            }
+
+            # Send sources
+            yield {
+                "type": "sources",
+                "sources": [
+                    {"text": s.text, "score": s.score, "metadata": s.metadata}
+                    for s in sources
+                ],
+            }
+
+            # Send completion
+            elapsed = round(time.time() - start, 2)
+            yield {
+                "type": "done",
+                "elapsed_seconds": elapsed,
+                "collection": collection,
+            }
+
+        except Exception as exc:
+            logger.error(f"Stream query failed: {exc}", exc_info=True)
+            yield {"type": "error", "error": str(exc)}
+
     def _get_engine(self, collection: str, top_k: Optional[int] = None, thinking: bool = True, model: Optional[str] = None) -> RetrieverQueryEngine:
         model_key = model or self.config.llm.model
         cache_key = f"{collection}:{top_k}:{'think' if thinking else 'fast'}:{model_key}"
@@ -150,6 +212,7 @@ class RAGQueryEngine:
             retriever=retriever,
             node_postprocessors=postprocessors,
             llm=llm,
+            response_mode="compact",  # Optimal synthesis mode
         )
         self._engines[cache_key] = engine
         return engine

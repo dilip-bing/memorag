@@ -19,6 +19,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Security, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRouter
 from fastapi.security.api_key import APIKeyHeader
 
@@ -209,6 +210,46 @@ async def query(request: QueryRequest):
 
     asyncio.create_task(_run())
     return TaskSubmittedResponse(task_id=task_id)
+
+
+@protected.post("/query/stream", tags=["RAG"])
+async def query_stream(request: QueryRequest):
+    """
+    Stream a RAG query with real-time status updates.
+    Returns Server-Sent Events (SSE) stream.
+    
+    Event types:
+    - status: {"type": "status", "status": "Thinking"|"Fast thinking", "phase": "retrieving"|"generating"}
+    - answer: {"type": "answer", "content": "..."}
+    - sources: {"type": "sources", "sources": [...]}
+    - done: {"type": "done", "elapsed_seconds": 123.45, "collection": "documents"}
+    - error: {"type": "error", "error": "error message"}
+    """
+    import json
+
+    async def event_generator():
+        try:
+            async for chunk in state.engine.aquery_stream(
+                question=request.question,
+                collection=request.collection,
+                top_k=request.top_k,
+                thinking=request.thinking,
+                model=request.model,
+            ):
+                yield f"data: {json.dumps(chunk)}\n\n"
+        except Exception as exc:
+            logger.error(f"Stream error: {exc}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
 
 
 @protected.get("/query/{task_id}", response_model=TaskStatusResponse, tags=["RAG"])
