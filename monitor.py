@@ -28,9 +28,29 @@ from fastapi.responses import HTMLResponse
 BASE_DIR = Path(__file__).parent
 API_CMD  = [sys.executable, "-u", str(BASE_DIR / "api.py")]  # -u = unbuffered stdout
 API_CWD  = str(BASE_DIR)
-CF_CMD   = ["cloudflared", "tunnel", "--url", "http://localhost:8000"]
 CF_CWD   = str(BASE_DIR)
 MONITOR_PORT = 8888
+
+def _find_cloudflared() -> list:
+    """Locate cloudflared binary — checks PATH first, then common Windows locations."""
+    import shutil
+    found = shutil.which("cloudflared")
+    if found:
+        return [found, "tunnel", "--url", "http://localhost:8000"]
+    if os.name == "nt":
+        candidates = [
+            str(BASE_DIR / "cloudflared.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\cloudflared\cloudflared.exe"),
+            os.path.expandvars(r"%USERPROFILE%\cloudflared.exe"),
+            r"C:\Program Files\cloudflared\cloudflared.exe",
+            r"C:\Windows\cloudflared.exe",
+        ]
+        for c in candidates:
+            if Path(c).exists():
+                return [c, "tunnel", "--url", "http://localhost:8000"]
+    return ["cloudflared", "tunnel", "--url", "http://localhost:8000"]
+
+CF_CMD = _find_cloudflared()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -125,6 +145,19 @@ def _store_log(entry: dict):
     if len(_LOG_HISTORY) > _LOG_HISTORY_MAX + 50:
         del _LOG_HISTORY[:-_LOG_HISTORY_MAX]
 
+async def _kill_port(port: int):
+    """Terminate any process listening on the given TCP port."""
+    try:
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.laddr and conn.laddr.port == port and conn.status in ("LISTEN", "ESTABLISHED"):
+                try:
+                    psutil.Process(conn.pid).terminate()
+                    await asyncio.sleep(0.6)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PROCESS MANAGER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -153,6 +186,10 @@ class ProcessManager:
         if self.proc and self.proc.returncode is None:
             await self._log(f"[{self.name}] Already running (pid {self.proc.pid})", "warn")
             return
+        # Kill any stray process on port 8000 before launching api
+        if self.name == "api":
+            await self._log("[api] Clearing port 8000...", "info")
+            await _kill_port(8000)
         await self._log(f"[{self.name}] Starting...", "ok")
         try:
             kwargs: dict = dict(
@@ -345,7 +382,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-/* ── Variables ── */
 :root {
   --bg:        #04080f;
   --bg2:       #07101c;
@@ -361,17 +397,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   --red:       #ff5252;
   --red-dim:   rgba(255,82,82,.12);
   --purple:    #c060ff;
-  --text:      #cce4f5;       /* main readable text */
-  --text2:     #6a9ab5;       /* secondary — still clearly visible */
-  --text3:     #3d6a88;       /* very dim — labels only */
+  --text:      #cce4f5;
+  --text2:     #6a9ab5;
+  --text3:     #3d6a88;
   --mono:      'JetBrains Mono', monospace;
   --hud:       'Orbitron', sans-serif;
 }
 
 *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
-html,body { height:100%; overflow:hidden; background:var(--bg); color:var(--text); }
+html,body { height:100%; overflow:hidden; background:var(--bg); color:var(--text); font-family:var(--mono); }
 
-/* Grid background — subtle, doesn't compete with text */
 body::before {
   content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
   background-image:
@@ -380,228 +415,167 @@ body::before {
   background-size:60px 60px;
 }
 
-/* ── Layout ── */
+/* ── App shell: column flex ── */
 #app { position:relative; z-index:1; display:flex; flex-direction:column; height:100vh; }
 
-/* Header */
+/* ── Header ── */
 #hdr {
   display:flex; align-items:center; gap:20px;
-  padding:0 24px; height:56px; flex-shrink:0;
-  background:var(--bg2);
-  border-bottom:2px solid var(--border);
+  padding:0 20px; height:50px; flex-shrink:0;
+  background:var(--bg2); border-bottom:2px solid var(--border);
 }
-.logo {
-  font-family:var(--hud); font-size:18px; font-weight:900; letter-spacing:.14em;
-  color:var(--cyan); text-shadow:0 0 20px rgba(0,200,255,.5);
-}
-.logo span { font-weight:600; font-size:13px; color:var(--text2); letter-spacing:.08em; }
-#hdr-clock {
-  font-family:var(--hud); font-size:18px; font-weight:600;
-  color:var(--text); letter-spacing:.12em;
-}
+.logo { font-family:var(--hud); font-size:17px; font-weight:900; letter-spacing:.14em; color:var(--cyan); text-shadow:0 0 18px rgba(0,200,255,.5); }
+.logo span { font-weight:600; font-size:12px; color:var(--text2); letter-spacing:.08em; }
+#hdr-clock { font-family:var(--hud); font-size:17px; font-weight:600; color:var(--text); letter-spacing:.12em; }
 .ws-pill {
-  display:flex; align-items:center; gap:8px;
-  padding:5px 14px; border-radius:20px;
+  display:flex; align-items:center; gap:7px; padding:4px 14px; border-radius:20px;
   border:1px solid var(--border); background:var(--cyan-dim);
-  font-family:var(--hud); font-size:12px; letter-spacing:.1em; color:var(--text2);
+  font-family:var(--hud); font-size:11px; letter-spacing:.1em; color:var(--text2);
 }
-#ws-dot { width:10px; height:10px; border-radius:50%; background:var(--red); transition:all .3s; }
+#ws-dot { width:9px; height:9px; border-radius:50%; background:var(--red); transition:all .3s; }
 #ws-dot.on { background:var(--green); box-shadow:0 0 10px var(--green); animation:blink 2s infinite; }
 
-/* Body split */
-#body {
-  flex:1; display:grid;
-  grid-template-columns:380px 1fr;
-  gap:2px; overflow:hidden;
-  background:rgba(0,200,255,.08);
+/* ── Vitals strip: full width across top ── */
+#vitals-strip {
+  flex-shrink:0; background:var(--panel);
+  padding:10px 16px 12px;
+  border-bottom:2px solid var(--border);
 }
-#left  { display:flex; flex-direction:column; gap:2px; overflow-y:auto; background:var(--bg); }
+#stat-grid { display:grid; grid-template-columns:repeat(6,1fr); gap:8px; }
+
+.gauge {
+  background:var(--bg3); border:1px solid var(--border); border-radius:6px;
+  padding:10px 14px; display:flex; flex-direction:column;
+}
+.g-lbl { font-family:var(--hud); font-size:10px; font-weight:600; letter-spacing:.18em; color:var(--text3); margin-bottom:2px; }
+.g-num { font-family:var(--hud); font-size:32px; font-weight:900; line-height:1.05; letter-spacing:-.01em; transition:color .4s; }
+.g-sub { font-size:11px; color:var(--text2); margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.g-bar  { margin-top:6px; height:4px; background:rgba(255,255,255,.07); border-radius:3px; overflow:hidden; }
+.g-fill { height:100%; border-radius:3px; transition:width .7s cubic-bezier(.4,0,.2,1); }
+.g-spark{ display:block; width:100%; height:22px; margin-top:5px; }
+
+.gc .g-num,.gc .g-fill { color:var(--cyan);   background:var(--cyan); }
+.gr .g-num,.gr .g-fill { color:#00e5c8;        background:#00e5c8; }
+.gd .g-num,.gd .g-fill { color:var(--purple);  background:var(--purple); }
+.gg .g-num,.gg .g-fill { color:var(--green);   background:var(--green); }
+.gv .g-num,.gv .g-fill { color:var(--amber);   background:var(--amber); }
+.gt .g-num,.gt .g-fill { color:var(--red);     background:var(--red); }
+
+/* ── Bottom area: left panel + logs ── */
+#bottom {
+  flex:1; display:grid; grid-template-columns:400px 1fr;
+  gap:2px; overflow:hidden; background:rgba(0,200,255,.07);
+}
+
+#left {
+  overflow-y:auto; background:var(--bg);
+  display:flex; flex-direction:column; gap:2px;
+}
+#left::-webkit-scrollbar { width:4px; }
+#left::-webkit-scrollbar-track { background:transparent; }
+#left::-webkit-scrollbar-thumb { background:var(--bg3); border-radius:2px; }
+
 #right { display:flex; flex-direction:column; overflow:hidden; background:var(--bg); }
 
-/* ── Panel shell ── */
-.panel {
-  background:var(--panel);
-  padding:18px 20px;
-  flex-shrink:0;
-}
+/* ── Panel ── */
+.panel { background:var(--panel); padding:14px 16px; flex-shrink:0; }
 .ptitle {
-  font-family:var(--hud); font-size:11px; font-weight:600;
-  letter-spacing:.2em; text-transform:uppercase;
-  color:var(--text3); margin-bottom:16px;
+  font-family:var(--hud); font-size:11px; font-weight:600; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--text3); margin-bottom:12px;
   display:flex; align-items:center; gap:10px;
 }
 .ptitle::after { content:''; flex:1; height:1px; background:var(--border); }
 
-/* ── Stat gauges — 3-column grid ── */
-#stat-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
-
-.gauge {
-  background:var(--bg3);
-  border:1px solid var(--border); border-radius:6px;
-  padding:14px 12px 10px;
-  display:flex; flex-direction:column; gap:0;
-}
-.g-lbl {
-  font-family:var(--hud); font-size:10px; font-weight:600;
-  letter-spacing:.18em; color:var(--text3); margin-bottom:4px;
-}
-.g-num {
-  font-family:var(--hud); font-size:36px; font-weight:900;
-  line-height:1; letter-spacing:-.01em;
-  transition:color .4s;
-}
-.g-sub {
-  font-family:var(--mono); font-size:11px; color:var(--text2);
-  margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-}
-.g-bar  { margin-top:8px; height:4px; background:rgba(255,255,255,.06); border-radius:3px; overflow:hidden; }
-.g-fill { height:100%; border-radius:3px; transition:width .7s cubic-bezier(.4,0,.2,1); }
-.g-spark{ display:block; width:100%; height:34px; margin-top:6px; }
-
-/* per-metric colour */
-.gc  { --c:var(--cyan);   } .gc .g-num,.gc .g-fill { color:var(--cyan);   background:var(--cyan);   }
-.gr  { --c:var(--cyan);   } .gr .g-num,.gr .g-fill { color:#00e5c8;       background:#00e5c8;       }
-.gd  { --c:var(--purple); } .gd .g-num,.gd .g-fill { color:var(--purple); background:var(--purple); }
-.gg  { --c:var(--green);  } .gg .g-num,.gg .g-fill { color:var(--green);  background:var(--green);  }
-.gv  { --c:var(--amber);  } .gv .g-num,.gv .g-fill { color:var(--amber);  background:var(--amber);  }
-.gt  { --c:var(--red);    } .gt .g-num,.gt .g-fill { color:var(--red);    background:var(--red);    }
-
-/* ── Network row ── */
-.net-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-.net-card {
-  background:var(--bg3); border:1px solid var(--border); border-radius:6px;
-  padding:12px 14px;
-}
-.net-lbl { font-family:var(--hud); font-size:10px; letter-spacing:.15em; color:var(--text3); margin-bottom:4px; }
-.net-val { font-family:var(--hud); font-size:22px; font-weight:600; color:var(--text); }
+/* ── Network ── */
+.net-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.net-card { background:var(--bg3); border:1px solid var(--border); border-radius:6px; padding:10px 12px; }
+.net-lbl { font-family:var(--hud); font-size:10px; letter-spacing:.15em; color:var(--text3); margin-bottom:3px; }
+.net-val { font-family:var(--hud); font-size:20px; font-weight:600; color:var(--text); }
 
 /* ── Process cards ── */
-.proc-card {
-  background:var(--bg3); border:1px solid var(--border); border-radius:6px;
-  padding:16px;
-}
-.proc-card + .proc-card { margin-top:10px; }
-.proc-top { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
-.proc-dot { width:14px; height:14px; border-radius:50%; flex-shrink:0; transition:all .3s; }
-.proc-dot.running { background:var(--green); box-shadow:0 0 12px var(--green); animation:blink 2s infinite; }
+.proc-card { background:var(--bg3); border:1px solid var(--border); border-radius:6px; padding:14px; }
+.proc-card + .proc-card { margin-top:8px; }
+.proc-top { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.proc-dot { width:12px; height:12px; border-radius:50%; flex-shrink:0; transition:all .3s; }
+.proc-dot.running { background:var(--green); box-shadow:0 0 10px var(--green); animation:blink 2s infinite; }
 .proc-dot.stopped { background:var(--text3); }
-.proc-dot.error   { background:var(--red);   box-shadow:0 0 12px var(--red); }
-.proc-name { font-family:var(--hud); font-size:15px; font-weight:600; color:var(--text); flex:1; }
-.proc-badge {
-  font-family:var(--hud); font-size:10px; letter-spacing:.1em;
-  padding:3px 10px; border-radius:3px;
-}
+.proc-dot.error   { background:var(--red); box-shadow:0 0 10px var(--red); }
+.proc-name { font-family:var(--hud); font-size:14px; font-weight:600; color:var(--text); flex:1; }
+.proc-badge { font-family:var(--hud); font-size:10px; letter-spacing:.1em; padding:3px 10px; border-radius:3px; }
 .pb-run  { background:var(--green-dim); color:var(--green); border:1px solid rgba(0,230,118,.35); }
 .pb-stop { background:rgba(255,255,255,.04); color:var(--text3); border:1px solid rgba(255,255,255,.1); }
-.pb-err  { background:var(--red-dim);   color:var(--red);   border:1px solid rgba(255,82,82,.35); }
+.pb-err  { background:var(--red-dim); color:var(--red); border:1px solid rgba(255,82,82,.35); }
+.proc-meta { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; color:var(--text2); margin-bottom:10px; }
+.proc-btns { display:flex; gap:7px; }
 
-.proc-meta {
-  display:flex; gap:18px; flex-wrap:wrap;
-  font-family:var(--mono); font-size:12px; color:var(--text2); margin-bottom:12px;
-}
-.proc-btns { display:flex; gap:8px; }
-
-/* ── Buttons — bigger, clear text ── */
 .btn {
-  font-family:var(--hud); font-size:12px; font-weight:600; letter-spacing:.1em;
-  padding:8px 18px; border-radius:4px; border:none; cursor:pointer;
+  font-family:var(--hud); font-size:11px; font-weight:600; letter-spacing:.1em;
+  padding:7px 16px; border-radius:4px; border:none; cursor:pointer;
   text-transform:uppercase; transition:all .15s;
 }
 .btn:hover { filter:brightness(1.2); transform:translateY(-1px); }
 .btn:active { transform:translateY(0); filter:brightness(.9); }
-.btn-go  { background:var(--green-dim); border:1px solid rgba(0,230,118,.5); color:var(--green); }
-.btn-stp { background:var(--red-dim);   border:1px solid rgba(255,82,82,.5);  color:var(--red); }
-.btn-rst { background:var(--amber-dim); border:1px solid rgba(255,179,0,.5);  color:var(--amber); }
+.btn-go  { background:var(--green-dim); border:1px solid rgba(0,230,118,.5);  color:var(--green); }
+.btn-stp { background:var(--red-dim);   border:1px solid rgba(255,82,82,.5);   color:var(--red); }
+.btn-rst { background:var(--amber-dim); border:1px solid rgba(255,179,0,.5);   color:var(--amber); }
 
-/* ── CF URL box ── */
+/* ── CF URL ── */
 #cf-box {
-  margin-top:14px;
-  background:rgba(0,200,255,.07);
-  border:1px solid rgba(0,200,255,.3);
-  border-radius:6px; padding:14px 16px;
+  margin-top:10px; background:rgba(0,200,255,.07);
+  border:1px solid rgba(0,200,255,.3); border-radius:6px; padding:12px 14px;
 }
-.cf-lbl { font-family:var(--hud); font-size:10px; letter-spacing:.18em; color:var(--text3); margin-bottom:6px; }
-#cf-url {
-  font-family:var(--mono); font-size:14px; color:var(--cyan);
-  word-break:break-all; line-height:1.5; cursor:pointer;
-  text-shadow:0 0 12px rgba(0,200,255,.4);
-}
+.cf-lbl { font-family:var(--hud); font-size:10px; letter-spacing:.18em; color:var(--text3); margin-bottom:5px; }
+#cf-url { font-size:13px; color:var(--cyan); word-break:break-all; line-height:1.45; cursor:pointer; text-shadow:0 0 10px rgba(0,200,255,.4); }
 #cf-url:hover { text-decoration:underline; }
-.cf-hint { font-family:var(--mono); font-size:11px; color:var(--text3); margin-top:6px; }
-
-/* GPU name row */
-.gpu-row {
-  margin-top:12px;
-  font-family:var(--mono); font-size:12px; color:var(--text2);
-}
+.cf-hint { font-size:10px; color:var(--text3); margin-top:4px; }
+.gpu-row { margin-top:10px; font-size:12px; color:var(--text2); }
 .gpu-row b { color:var(--text); }
 
 /* ── Log panel ── */
 #log-hdr {
-  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
-  padding:12px 18px; flex-shrink:0;
+  display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  padding:9px 16px; flex-shrink:0;
   background:var(--bg2); border-bottom:2px solid var(--border);
 }
-.log-hdr-title {
-  font-family:var(--hud); font-size:13px; font-weight:600;
-  letter-spacing:.12em; color:var(--text);
-}
+.log-hdr-title { font-family:var(--hud); font-size:12px; font-weight:600; letter-spacing:.12em; color:var(--text); }
 .flt {
-  font-family:var(--hud); font-size:11px; letter-spacing:.1em;
-  padding:5px 14px; border-radius:4px; cursor:pointer;
+  font-family:var(--hud); font-size:10px; letter-spacing:.1em;
+  padding:4px 12px; border-radius:4px; cursor:pointer;
   background:transparent; border:1px solid rgba(255,255,255,.1);
   color:var(--text2); transition:all .15s; text-transform:uppercase;
 }
 .flt:hover  { border-color:var(--cyan); color:var(--cyan); }
 .flt.active { background:var(--cyan-dim); border-color:var(--cyan); color:var(--cyan); }
-#log-count { font-family:var(--mono); font-size:12px; color:var(--text2); margin-left:auto; }
-.follow-label {
-  display:flex; align-items:center; gap:6px;
-  font-family:var(--mono); font-size:12px; color:var(--text2); cursor:pointer;
-}
-.follow-label input { accent-color:var(--cyan); width:14px; height:14px; cursor:pointer; }
+#log-count { font-size:11px; color:var(--text2); margin-left:auto; }
+.follow-label { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text2); cursor:pointer; }
+.follow-label input { accent-color:var(--cyan); width:13px; height:13px; cursor:pointer; }
 .btn-clear {
-  font-family:var(--hud); font-size:11px; letter-spacing:.1em;
-  padding:5px 14px; border-radius:4px; cursor:pointer;
+  font-family:var(--hud); font-size:10px; letter-spacing:.1em;
+  padding:4px 12px; border-radius:4px; cursor:pointer;
   background:var(--red-dim); border:1px solid rgba(255,82,82,.4);
   color:var(--red); text-transform:uppercase; transition:all .15s;
 }
 .btn-clear:hover { background:rgba(255,82,82,.2); }
 
-/* Log stream */
-#log-body {
-  flex:1; overflow-y:auto; padding:4px 0;
-  font-family:var(--mono); font-size:13px;
-  background:var(--bg);
-}
+#log-body { flex:1; overflow-y:auto; padding:2px 0; font-size:13px; background:var(--bg); }
 #log-body::-webkit-scrollbar { width:5px; }
 #log-body::-webkit-scrollbar-track { background:transparent; }
 #log-body::-webkit-scrollbar-thumb { background:var(--bg3); border-radius:3px; }
 
 .ll {
-  display:grid;
-  grid-template-columns:80px 90px 1fr;
-  gap:0 10px;
-  padding:4px 18px;
-  border-bottom:1px solid rgba(255,255,255,.03);
-  animation:slideIn .15s ease;
+  display:grid; grid-template-columns:76px 88px 1fr; gap:0 8px;
+  padding:3px 16px; border-bottom:1px solid rgba(255,255,255,.03);
+  animation:slideIn .12s ease;
 }
 .ll:hover { background:rgba(255,255,255,.03); }
-
-@keyframes slideIn { from{opacity:0;transform:translateX(-6px)} to{opacity:1;transform:none} }
+@keyframes slideIn { from{opacity:0;transform:translateX(-4px)} to{opacity:1;transform:none} }
 
 .ll-ts  { color:var(--text3); font-size:11px; padding-top:1px; white-space:nowrap; }
-.ll-src {
-  font-size:11px; font-weight:600; letter-spacing:.06em;
-  padding:1px 6px; border-radius:3px; text-align:center;
-  white-space:nowrap; align-self:start;
-}
+.ll-src { font-size:10px; font-weight:600; letter-spacing:.06em; padding:1px 5px; border-radius:3px; text-align:center; white-space:nowrap; align-self:start; }
 .src-api         { color:var(--cyan);   background:var(--cyan-dim); }
 .src-cloudflared { color:var(--purple); background:rgba(192,96,255,.1); }
 .src-system      { color:var(--amber);  background:var(--amber-dim); }
-.ll-txt { color:var(--text2); word-break:break-word; line-height:1.55; }
-
-/* level colours for the text */
+.ll-txt { color:var(--text2); word-break:break-word; line-height:1.5; }
 .lv-ok    .ll-txt { color:#4ddb8a; }
 .lv-warn  .ll-txt { color:var(--amber); }
 .lv-error .ll-txt { color:var(--red); font-weight:600; }
@@ -609,21 +583,14 @@ body::before {
 
 /* ── Toast ── */
 #toast {
-  position:fixed; bottom:24px; right:24px; z-index:9999;
+  position:fixed; bottom:20px; right:20px; z-index:9999;
   background:var(--green-dim); border:1px solid var(--green);
-  color:var(--green); font-family:var(--hud); font-size:13px; letter-spacing:.12em;
-  padding:10px 22px; border-radius:6px;
+  color:var(--green); font-family:var(--hud); font-size:12px; letter-spacing:.12em;
+  padding:9px 20px; border-radius:6px;
   opacity:0; transform:translateY(8px); pointer-events:none; transition:all .25s;
 }
 #toast.show { opacity:1; transform:none; }
-
-/* ── Animations ── */
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.45} }
-
-/* ── Left column scrollbar ── */
-#left::-webkit-scrollbar { width:4px; }
-#left::-webkit-scrollbar-track { background:transparent; }
-#left::-webkit-scrollbar-thumb { background:var(--bg3); border-radius:2px; }
 </style>
 </head>
 <body>
@@ -640,77 +607,61 @@ body::before {
     </div>
   </div>
 
-  <!-- BODY -->
-  <div id="body">
+  <!-- VITALS STRIP — full width across top -->
+  <div id="vitals-strip">
+    <div class="ptitle">System Vitals</div>
+    <div id="stat-grid">
+      <div class="gauge gc">
+        <div class="g-lbl">CPU</div>
+        <div class="g-num" id="v-cpu">--</div>
+        <div class="g-sub" id="s-cpu">utilization</div>
+        <div class="g-bar"><div class="g-fill" id="b-cpu" style="width:0"></div></div>
+        <canvas class="g-spark" id="sp-cpu"></canvas>
+      </div>
+      <div class="gauge gr">
+        <div class="g-lbl">RAM</div>
+        <div class="g-num" id="v-ram">--</div>
+        <div class="g-sub" id="s-ram">% used</div>
+        <div class="g-bar"><div class="g-fill" id="b-ram" style="width:0"></div></div>
+        <canvas class="g-spark" id="sp-ram"></canvas>
+      </div>
+      <div class="gauge gd">
+        <div class="g-lbl">DISK</div>
+        <div class="g-num" id="v-dsk">--</div>
+        <div class="g-sub" id="s-dsk">% used</div>
+        <div class="g-bar"><div class="g-fill" id="b-dsk" style="width:0"></div></div>
+        <canvas class="g-spark" id="sp-dsk"></canvas>
+      </div>
+      <div class="gauge gg">
+        <div class="g-lbl">GPU</div>
+        <div class="g-num" id="v-gpu">--</div>
+        <div class="g-sub" id="s-gpu">load %</div>
+        <div class="g-bar"><div class="g-fill" id="b-gpu" style="width:0"></div></div>
+        <canvas class="g-spark" id="sp-gpu"></canvas>
+      </div>
+      <div class="gauge gv">
+        <div class="g-lbl">VRAM</div>
+        <div class="g-num" id="v-vrm">--</div>
+        <div class="g-sub" id="s-vrm">MB used</div>
+        <div class="g-bar"><div class="g-fill" id="b-vrm" style="width:0"></div></div>
+        <canvas class="g-spark" id="sp-vrm"></canvas>
+      </div>
+      <div class="gauge gt">
+        <div class="g-lbl">TEMP</div>
+        <div class="g-num" id="v-tmp">--</div>
+        <div class="g-sub" id="s-tmp">°C</div>
+        <div class="g-bar"><div class="g-fill" id="b-tmp" style="width:0"></div></div>
+        <canvas class="g-spark" id="sp-tmp"></canvas>
+      </div>
+    </div>
+  </div>
 
-    <!-- ══ LEFT ══ -->
+  <!-- BOTTOM: left controls + right logs -->
+  <div id="bottom">
+
+    <!-- LEFT: process control + network -->
     <div id="left">
 
-      <!-- System Vitals -->
-      <div class="panel">
-        <div class="ptitle">System Vitals</div>
-        <div id="stat-grid">
-          <div class="gauge gc">
-            <div class="g-lbl">CPU</div>
-            <div class="g-num" id="v-cpu">--</div>
-            <div class="g-sub" id="s-cpu">utilization %</div>
-            <div class="g-bar"><div class="g-fill" id="b-cpu" style="width:0"></div></div>
-            <canvas class="g-spark" id="sp-cpu"></canvas>
-          </div>
-          <div class="gauge gr">
-            <div class="g-lbl">RAM</div>
-            <div class="g-num" id="v-ram">--</div>
-            <div class="g-sub" id="s-ram">% used</div>
-            <div class="g-bar"><div class="g-fill" id="b-ram" style="width:0"></div></div>
-            <canvas class="g-spark" id="sp-ram"></canvas>
-          </div>
-          <div class="gauge gd">
-            <div class="g-lbl">DISK</div>
-            <div class="g-num" id="v-dsk">--</div>
-            <div class="g-sub" id="s-dsk">% used</div>
-            <div class="g-bar"><div class="g-fill" id="b-dsk" style="width:0"></div></div>
-            <canvas class="g-spark" id="sp-dsk"></canvas>
-          </div>
-          <div class="gauge gg">
-            <div class="g-lbl">GPU</div>
-            <div class="g-num" id="v-gpu">--</div>
-            <div class="g-sub">load %</div>
-            <div class="g-bar"><div class="g-fill" id="b-gpu" style="width:0"></div></div>
-            <canvas class="g-spark" id="sp-gpu"></canvas>
-          </div>
-          <div class="gauge gv">
-            <div class="g-lbl">VRAM</div>
-            <div class="g-num" id="v-vrm">--</div>
-            <div class="g-sub" id="s-vrm">MB used</div>
-            <div class="g-bar"><div class="g-fill" id="b-vrm" style="width:0"></div></div>
-            <canvas class="g-spark" id="sp-vrm"></canvas>
-          </div>
-          <div class="gauge gt">
-            <div class="g-lbl">GPU TEMP</div>
-            <div class="g-num" id="v-tmp">--</div>
-            <div class="g-sub">degrees C</div>
-            <div class="g-bar"><div class="g-fill" id="b-tmp" style="width:0"></div></div>
-            <canvas class="g-spark" id="sp-tmp"></canvas>
-          </div>
-        </div>
-      </div>
-
-      <!-- Network -->
-      <div class="panel">
-        <div class="ptitle">Network I/O</div>
-        <div class="net-row">
-          <div class="net-card">
-            <div class="net-lbl">DOWNLOAD</div>
-            <div class="net-val" id="net-rx">-- KB/s</div>
-          </div>
-          <div class="net-card">
-            <div class="net-lbl">UPLOAD</div>
-            <div class="net-val" id="net-tx">-- KB/s</div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Process Control -->
       <div class="panel">
         <div class="ptitle">Process Control</div>
 
@@ -758,16 +709,30 @@ body::before {
         <div id="cf-box">
           <div class="cf-lbl">Cloudflare Tunnel URL</div>
           <div id="cf-url" onclick="copyUrl()">Waiting for cloudflared...</div>
-          <div class="cf-hint">Click URL to copy to clipboard</div>
+          <div class="cf-hint">Click to copy</div>
         </div>
 
-        <!-- GPU name -->
         <div class="gpu-row">GPU: <b id="gpu-name">detecting...</b></div>
+      </div>
+
+      <!-- Network -->
+      <div class="panel">
+        <div class="ptitle">Network I/O</div>
+        <div class="net-row">
+          <div class="net-card">
+            <div class="net-lbl">DOWNLOAD</div>
+            <div class="net-val" id="net-rx">-- KB/s</div>
+          </div>
+          <div class="net-card">
+            <div class="net-lbl">UPLOAD</div>
+            <div class="net-val" id="net-tx">-- KB/s</div>
+          </div>
+        </div>
       </div>
 
     </div><!-- /left -->
 
-    <!-- ══ RIGHT — LOGS ══ -->
+    <!-- RIGHT: logs -->
     <div id="right">
       <div id="log-hdr">
         <span class="log-hdr-title">LOG STREAM</span>
@@ -784,7 +749,7 @@ body::before {
       <div id="log-body"></div>
     </div>
 
-  </div><!-- /body -->
+  </div><!-- /bottom -->
 </div>
 
 <div id="toast">URL COPIED</div>
