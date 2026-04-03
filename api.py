@@ -571,33 +571,43 @@ JSON array:""",
         },
     ]
 
+    import re, json as _json
+
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=90) as client:   # 90s — model may be busy
             r = await client.post(
                 f"{settings.llm.base_url}/api/chat",
                 json={
                     "model": settings.llm.model,
                     "messages": messages,
                     "stream": False,
-                    "think": False,
+                    "think": False,          # suppress thinking for speed
                     "options": {"temperature": 0.1, "num_predict": 1000},
                 },
             )
             r.raise_for_status()
             raw = r.json()["message"]["content"].strip()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=502, detail="LLM timed out — try again in a moment")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"Ollama error {exc.response.status_code}: {exc.response.text[:200]}")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"LLM unreachable: {exc}")
 
-    # Extract JSON array from response (handle any stray text)
-    import re, json as _json
+    # Strip <think>...</think> blocks that reasoning models may inject
+    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+
+    # Extract the JSON array (tolerates extra prose before/after)
     match = re.search(r'\[.*\]', raw, re.DOTALL)
     if not match:
-        return {"cards": [], "raw": raw}
+        logger.warning(f"Memory extract: no JSON array in response: {raw[:200]}")
+        return {"cards": []}
 
     try:
         raw_cards = _json.loads(match.group())
-    except _json.JSONDecodeError:
-        return {"cards": [], "raw": raw}
+    except _json.JSONDecodeError as exc:
+        logger.warning(f"Memory extract: JSON parse failed: {exc} — raw: {raw[:200]}")
+        return {"cards": []}
 
     valid_types = {'fact', 'preference', 'context', 'skill', 'goal'}
     valid_imp   = {'high', 'medium', 'low'}
