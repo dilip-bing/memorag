@@ -460,12 +460,13 @@ body::before {
 .g-fill { height:100%; border-radius:3px; transition:width .7s cubic-bezier(.4,0,.2,1); }
 .g-spark{ display:block; width:100%; height:22px; margin-top:5px; }
 
-.gc .g-num,.gc .g-fill { color:var(--cyan);   background:var(--cyan); }
-.gr .g-num,.gr .g-fill { color:#00e5c8;        background:#00e5c8; }
-.gd .g-num,.gd .g-fill { color:var(--purple);  background:var(--purple); }
-.gg .g-num,.gg .g-fill { color:var(--green);   background:var(--green); }
-.gv .g-num,.gv .g-fill { color:var(--amber);   background:var(--amber); }
-.gt .g-num,.gt .g-fill { color:var(--red);     background:var(--red); }
+/* number text colour only — no background on the text element */
+.gc .g-num { color:var(--cyan);   } .gc .g-fill { background:var(--cyan);   }
+.gr .g-num { color:#00e5c8;       } .gr .g-fill { background:#00e5c8;       }
+.gd .g-num { color:var(--purple); } .gd .g-fill { background:var(--purple); }
+.gg .g-num { color:var(--green);  } .gg .g-fill { background:var(--green);  }
+.gv .g-num { color:var(--amber);  } .gv .g-fill { background:var(--amber);  }
+.gt .g-num { color:var(--red);    } .gt .g-fill { background:var(--red);    }
 
 /* ── Bottom area: left panel + logs ── */
 #bottom {
