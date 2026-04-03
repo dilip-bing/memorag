@@ -34,21 +34,27 @@ MONITOR_PORT = 8888
 def _find_cloudflared() -> list:
     """Locate cloudflared binary — checks PATH first, then common Windows locations."""
     import shutil
+    CF_ARGS = [
+        "tunnel", "--url", "http://localhost:8000",
+        "--proxy-connect-timeout", "600s",
+        "--proxy-keepalive-timeout", "600s",
+    ]
     found = shutil.which("cloudflared")
     if found:
-        return [found, "tunnel", "--url", "http://localhost:8000"]
+        return [found] + CF_ARGS
     if os.name == "nt":
         candidates = [
+            r"C:\Program Files (x86)\cloudflared\cloudflared.exe",
+            r"C:\Program Files\cloudflared\cloudflared.exe",
             str(BASE_DIR / "cloudflared.exe"),
             os.path.expandvars(r"%LOCALAPPDATA%\Programs\cloudflared\cloudflared.exe"),
             os.path.expandvars(r"%USERPROFILE%\cloudflared.exe"),
-            r"C:\Program Files\cloudflared\cloudflared.exe",
             r"C:\Windows\cloudflared.exe",
         ]
         for c in candidates:
             if Path(c).exists():
-                return [c, "tunnel", "--url", "http://localhost:8000"]
-    return ["cloudflared", "tunnel", "--url", "http://localhost:8000"]
+                return [c] + CF_ARGS
+    return ["cloudflared"] + CF_ARGS
 
 CF_CMD = _find_cloudflared()
 
