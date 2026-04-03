@@ -30,7 +30,7 @@ from rag.store.chroma_store import ChromaManager
 from rag.store.index_manager import IndexManager
 from rag.ingest.pipeline import RAGIngestionPipeline
 from rag.query.engine import RAGQueryEngine
-from rag.models.requests import QueryRequest, IngestRequest
+from rag.models.requests import QueryRequest, IngestRequest, MemoryExtractRequest, GlobalMemoryUpdateRequest
 from rag.models.responses import (
     QueryResponse,
     IngestResponse,
@@ -521,6 +521,122 @@ async def list_models():
             }
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Could not reach Ollama: {exc}")
+
+
+# ── Memory endpoints ───────────────────────────────────────────────────────
+
+@protected.post("/memory/extract", tags=["Memory"])
+async def extract_memory(request: MemoryExtractRequest):
+    """
+    Use the local LLM to convert raw brain-dump text into structured memory cards.
+    Returns a list of typed, tagged cards ready to display in the UI.
+    """
+    if not request.text.strip():
+        return {"cards": []}
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a memory extraction assistant. "
+                "Extract structured facts from text and return ONLY a JSON array. "
+                "No markdown fences, no explanation — raw JSON array only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"""Extract memory cards from this text.
+
+Text: \"{request.text}\"
+
+Return a JSON array where each object has:
+- "type": one of "fact" | "preference" | "context" | "skill" | "goal"
+- "content": clear, standalone statement (max 120 chars)
+- "importance": "high" | "medium" | "low"
+- "tags": array of 1-3 short lowercase tags
+
+Type guide:
+  fact        — who they are (name, job, location, background)
+  preference  — how they like things (style, format, level of detail)
+  context     — current project, situation, or challenge
+  skill       — expertise, tools, languages they know
+  goal        — what they're trying to achieve
+
+Rules:
+  - Only extract what is explicitly stated — NO hallucination
+  - Make each card standalone and self-contained
+  - Return [] if nothing useful is found
+
+JSON array:""",
+        },
+    ]
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{settings.llm.base_url}/api/chat",
+                json={
+                    "model": settings.llm.model,
+                    "messages": messages,
+                    "stream": False,
+                    "think": False,
+                    "options": {"temperature": 0.1, "num_predict": 1000},
+                },
+            )
+            r.raise_for_status()
+            raw = r.json()["message"]["content"].strip()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM unreachable: {exc}")
+
+    # Extract JSON array from response (handle any stray text)
+    import re, json as _json
+    match = re.search(r'\[.*\]', raw, re.DOTALL)
+    if not match:
+        return {"cards": [], "raw": raw}
+
+    try:
+        raw_cards = _json.loads(match.group())
+    except _json.JSONDecodeError:
+        return {"cards": [], "raw": raw}
+
+    valid_types = {'fact', 'preference', 'context', 'skill', 'goal'}
+    valid_imp   = {'high', 'medium', 'low'}
+    now = int(datetime.utcnow().timestamp() * 1000)
+    cards = []
+    for c in raw_cards:
+        if not isinstance(c, dict) or not c.get('content'):
+            continue
+        cards.append({
+            "id":         str(uuid.uuid4()),
+            "type":       c.get("type") if c.get("type") in valid_types else "fact",
+            "content":    str(c.get("content", ""))[:200].strip(),
+            "importance": c.get("importance") if c.get("importance") in valid_imp else "medium",
+            "tags":       [str(t).lower()[:30] for t in c.get("tags", []) if t][:5],
+            "createdAt":  now,
+        })
+
+    return {"cards": cards}
+
+
+@protected.get("/memory/global", tags=["Memory"])
+async def get_global_memory(user_id: str):
+    """Return a user's global (cross-chat) memory cards."""
+    if not auth.get_user_by_id(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    cards = auth.get_global_memory(user_id)
+    return {"cards": cards, "count": len(cards)}
+
+
+@protected.put("/memory/global", tags=["Memory"])
+async def update_global_memory(user_id: str, request: GlobalMemoryUpdateRequest):
+    """Replace a user's global memory cards (full overwrite)."""
+    if not auth.get_user_by_id(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    cards = [c.model_dump() for c in request.cards]
+    ok = auth.update_global_memory(user_id, cards)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to save memory")
+    return {"status": "saved", "count": len(cards)}
 
 
 app.include_router(protected)

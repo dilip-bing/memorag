@@ -19,7 +19,7 @@ DB_PATH = Path(__file__).parent / "storage" / "users.db"
 def init_db():
     """Initialize user database"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    
+
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -27,10 +27,17 @@ def init_db():
             email TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             picture TEXT,
+            global_memory TEXT DEFAULT '[]',
             created_at TEXT NOT NULL,
             last_login TEXT NOT NULL
         )
     """)
+    # Migrate: add global_memory column if it doesn't exist yet
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN global_memory TEXT DEFAULT '[]'")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
     conn.commit()
     conn.close()
     logger.info(f"User database initialized at {DB_PATH}")
@@ -123,6 +130,39 @@ def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
     conn.close()
     
     return dict(row) if row else None
+
+
+def get_global_memory(user_id: str) -> list:
+    """Get a user's global memory cards."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute("SELECT global_memory FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row or not row["global_memory"]:
+        return []
+    try:
+        return json.loads(row["global_memory"])
+    except Exception:
+        return []
+
+
+def update_global_memory(user_id: str, cards: list) -> bool:
+    """Replace a user's global memory cards."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "UPDATE users SET global_memory = ? WHERE id = ?",
+            (json.dumps(cards), user_id)
+        )
+        conn.commit()
+        logger.info(f"Global memory updated for user {user_id}: {len(cards)} cards")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update global memory: {e}")
+        return False
+    finally:
+        conn.close()
 
 
 # Initialize database on module import

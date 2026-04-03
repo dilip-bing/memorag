@@ -21,3 +21,20 @@ class QueryRequest(BaseModel):
 
 class CollectionRequest(BaseModel):
     name: str = Field(..., description="Collection name")
+
+
+class MemoryExtractRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Raw brain-dump text to extract memory from")
+
+
+class MemoryCardModel(BaseModel):
+    id: str
+    type: str  # fact | preference | context | skill | goal
+    content: str
+    importance: str  # high | medium | low
+    tags: list[str] = []
+    createdAt: int
+
+
+class GlobalMemoryUpdateRequest(BaseModel):
+    cards: list[MemoryCardModel]
