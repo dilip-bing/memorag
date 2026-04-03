@@ -807,6 +807,41 @@ async def update_global_memory(user_id: str, request: GlobalMemoryUpdateRequest)
     return {"status": "saved", "count": len(cards)}
 
 
+# ── Chat sync endpoints ────────────────────────────────────────────────────
+
+class ChatSaveRequest(BaseModel):
+    user_id: str
+    chat: Dict[str, Any]
+
+
+@protected.get("/chats", tags=["Chats"])
+async def list_chats(user_id: str):
+    """Return all persisted chats for a user (used for cross-device sync)."""
+    if not auth.get_user_by_id(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"chats": auth.get_chats(user_id)}
+
+
+@protected.put("/chats/{chat_id}", tags=["Chats"])
+async def save_chat(chat_id: str, request: ChatSaveRequest):
+    """Upsert a single chat (called after each message / rename / memory update)."""
+    if not auth.get_user_by_id(request.user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    if request.chat.get("id") != chat_id:
+        raise HTTPException(status_code=400, detail="chat_id mismatch")
+    ok = auth.save_chat(request.user_id, request.chat)
+    return {"status": "saved" if ok else "error"}
+
+
+@protected.delete("/chats/{chat_id}", tags=["Chats"])
+async def delete_chat_endpoint(chat_id: str, user_id: str):
+    """Delete a chat from the backend (called when user deletes locally)."""
+    if not auth.get_user_by_id(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    auth.delete_chat_db(user_id, chat_id)
+    return {"status": "deleted"}
+
+
 app.include_router(protected)
 
 

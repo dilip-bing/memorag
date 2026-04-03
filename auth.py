@@ -32,6 +32,15 @@ def init_db():
             last_login TEXT NOT NULL
         )
     """)
+    # chats table — stores full chat JSON per user, one row per chat
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chats (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            data TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+    """)
     # Migrate: add global_memory column if it doesn't exist yet
     try:
         conn.execute("ALTER TABLE users ADD COLUMN global_memory TEXT DEFAULT '[]'")
@@ -160,6 +169,68 @@ def update_global_memory(user_id: str, cards: list) -> bool:
         return True
     except Exception as e:
         logger.error(f"Failed to update global memory: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+# ── Chat persistence ───────────────────────────────────────────────────────
+
+def get_chats(user_id: str) -> list:
+    """Return all chats for a user, newest first."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT data FROM chats WHERE user_id = ? ORDER BY updated_at DESC",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        try:
+            result.append(json.loads(row["data"]))
+        except Exception:
+            pass
+    return result
+
+
+def save_chat(user_id: str, chat: dict) -> bool:
+    """Upsert a single chat (full JSON blob)."""
+    chat_id = chat.get("id")
+    if not chat_id:
+        return False
+    now = int(datetime.utcnow().timestamp() * 1000)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            """INSERT INTO chats (id, user_id, data, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   data = excluded.data,
+                   updated_at = excluded.updated_at""",
+            (chat_id, user_id, json.dumps(chat), now),
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save chat {chat_id}: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def delete_chat_db(user_id: str, chat_id: str) -> bool:
+    """Delete a chat by ID (only if it belongs to user)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "DELETE FROM chats WHERE id = ? AND user_id = ?",
+            (chat_id, user_id),
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete chat {chat_id}: {e}")
         return False
     finally:
         conn.close()
