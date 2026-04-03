@@ -17,6 +17,21 @@ from llama_index.llms.ollama import Ollama
 # to the knowledge base → skip RAG and answer from general LLM knowledge.
 GENERAL_KNOWLEDGE_THRESHOLD = 0.40
 
+# ── System prompt — priority hierarchy ────────────────────────────────────
+_SYSTEM_PROMPT = (
+    "You are a helpful AI assistant. Follow this strict priority order:\n"
+    "1. CURRENT CONVERSATION — the chat history is your primary source; "
+    "treat everything the user has stated as ground truth; never contradict it\n"
+    "2. UPLOADED DOCUMENTS — use document context only when directly relevant to the question\n"
+    "3. STORED MEMORY — use stored user context only for personally relevant questions\n"
+    "4. YOUR TRAINING KNOWLEDGE — fall back to this when none of the above apply\n\n"
+    "Rules:\n"
+    "- Never say 'the context does not contain' or 'I don't have information about' — just answer\n"
+    "- Never correct or challenge what the user states about themselves or their situation\n"
+    "- Match response length to question complexity; short question = concise answer\n"
+    "- Never end with motivational phrases, encouragement, or 'you can do it' style closings"
+)
+
 # ── Smart QA prompt ────────────────────────────────────────────────────────
 # Allows the LLM to use its own knowledge when documents aren't relevant.
 _QA_PROMPT = PromptTemplate(
@@ -33,6 +48,27 @@ _QA_PROMPT = PromptTemplate(
     "  - Be direct and concise.\n\n"
     "Answer:"
 )
+
+
+def _build_history_context(chat_history: list) -> str:
+    """Format the last 8 chat messages as a context block to prepend to the question."""
+    if not chat_history:
+        return ''
+    lines = ['--- RECENT CONVERSATION HISTORY ---']
+    for msg in chat_history[-8:]:
+        role = 'User' if msg.get('role') == 'user' else 'Assistant'
+        content = (msg.get('content') or '').strip()
+        if not content:
+            continue
+        # Truncate very long messages
+        if len(content) > 600:
+            content = content[:600] + '…'
+        lines.append(f'{role}: {content}')
+    if len(lines) == 1:
+        return ''  # no real messages
+    lines.append('--- END HISTORY ---')
+    lines.append('')
+    return '\n'.join(lines)
 
 from rag.config import AppConfig
 from rag.exceptions import LLMError, RetrievalError
@@ -72,6 +108,7 @@ class RAGQueryEngine:
             temperature=config.llm.temperature,
             context_window=config.llm.context_window,
             thinking=True,
+            system_prompt=_SYSTEM_PROMPT,
         )
         self._llm_fast = Ollama(
             model=config.llm.model,
@@ -80,6 +117,7 @@ class RAGQueryEngine:
             temperature=config.llm.temperature,
             context_window=config.llm.context_window,
             thinking=False,
+            system_prompt=_SYSTEM_PROMPT,
         )
         Settings.llm = self._llm_fast  # default to fast
         logger.info(f"Query engine ready - LLM: {config.llm.model}")
@@ -94,6 +132,7 @@ class RAGQueryEngine:
                 temperature=self.config.llm.temperature,
                 context_window=self.config.llm.context_window,
                 thinking=thinking,
+                system_prompt=_SYSTEM_PROMPT,
             )
         return self._llm_think if thinking else self._llm_fast
 
@@ -135,19 +174,23 @@ class RAGQueryEngine:
             elapsed_seconds=round(time.time() - start, 2),
         )
 
-    def query(self, question: str, collection: str = "documents", top_k: Optional[int] = None, thinking: bool = True, model: Optional[str] = None) -> QueryResult:
+    def query(self, question: str, collection: str = "documents", top_k: Optional[int] = None, thinking: bool = True, model: Optional[str] = None, chat_history: Optional[list] = None) -> QueryResult:
         """Synchronous RAG query with automatic general-knowledge fallback."""
         start = time.time()
         try:
             engine = self._get_engine(collection, top_k, thinking, model)
             llm = self._get_llm(thinking, model)
 
-            max_score = self._check_relevance(engine, question)
+            # Prepend conversation history so the model respects Priority 1
+            history_ctx = _build_history_context(chat_history or [])
+            full_question = f"{history_ctx}\n{question}" if history_ctx else question
+
+            max_score = self._check_relevance(engine, full_question)
             if max_score < GENERAL_KNOWLEDGE_THRESHOLD:
                 logger.info(f"General-knowledge mode (max_score={max_score:.3f} < {GENERAL_KNOWLEDGE_THRESHOLD})")
-                return self._direct_llm_result(question, llm, collection, round(time.time() - start, 2))
+                return self._direct_llm_result(full_question, llm, collection, round(time.time() - start, 2))
 
-            response = engine.query(question)
+            response = engine.query(full_question)
             sources = [
                 SourceNode(
                     text=n.node.get_content()[:500],
@@ -166,19 +209,23 @@ class RAGQueryEngine:
         except Exception as exc:
             raise LLMError(f"Query failed: {exc}") from exc
 
-    async def aquery(self, question: str, collection: str = "documents", top_k: Optional[int] = None, thinking: bool = True, model: Optional[str] = None) -> QueryResult:
+    async def aquery(self, question: str, collection: str = "documents", top_k: Optional[int] = None, thinking: bool = True, model: Optional[str] = None, chat_history: Optional[list] = None) -> QueryResult:
         """Async RAG query with automatic general-knowledge fallback."""
         start = time.time()
         try:
             engine = self._get_engine(collection, top_k, thinking, model)
             llm = self._get_llm(thinking, model)
 
-            max_score = await self._acheck_relevance(engine, question)
+            # Prepend conversation history so the model respects Priority 1
+            history_ctx = _build_history_context(chat_history or [])
+            full_question = f"{history_ctx}\n{question}" if history_ctx else question
+
+            max_score = await self._acheck_relevance(engine, full_question)
             if max_score < GENERAL_KNOWLEDGE_THRESHOLD:
                 logger.info(f"General-knowledge mode (max_score={max_score:.3f} < {GENERAL_KNOWLEDGE_THRESHOLD})")
-                return await self._adirect_llm_result(question, llm, collection, start)
+                return await self._adirect_llm_result(full_question, llm, collection, start)
 
-            response = await engine.aquery(question)
+            response = await engine.aquery(full_question)
             sources = [
                 SourceNode(
                     text=n.node.get_content()[:500],
@@ -204,6 +251,7 @@ class RAGQueryEngine:
         top_k: Optional[int] = None,
         thinking: bool = True,
         model: Optional[str] = None,
+        chat_history: Optional[list] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Stream RAG query with status updates and tokens."""
         start = time.time()
@@ -214,12 +262,16 @@ class RAGQueryEngine:
             engine = self._get_engine(collection, top_k, thinking, model)
             llm = self._get_llm(thinking, model)
 
+            # Prepend conversation history so the model respects Priority 1
+            history_ctx = _build_history_context(chat_history or [])
+            full_question = f"{history_ctx}\n{question}" if history_ctx else question
+
             # Relevance check — bypass RAG for general knowledge questions
-            max_score = await self._acheck_relevance(engine, question)
+            max_score = await self._acheck_relevance(engine, full_question)
             if max_score < GENERAL_KNOWLEDGE_THRESHOLD:
                 logger.info(f"Stream general-knowledge mode (max_score={max_score:.3f})")
                 yield {"type": "status", "status": status_label, "phase": "generating"}
-                gk = await llm.acomplete(question)
+                gk = await llm.acomplete(full_question)
                 yield {"type": "answer", "content": str(gk)}
                 yield {"type": "sources", "sources": []}
                 yield {"type": "done", "elapsed_seconds": round(time.time() - start, 2), "collection": collection}
@@ -228,7 +280,7 @@ class RAGQueryEngine:
             yield {"type": "status", "status": status_label, "phase": "generating"}
 
             # Stream the response
-            streaming_response = await engine.aquery(question)
+            streaming_response = await engine.aquery(full_question)
             
             # Extract sources
             sources = [

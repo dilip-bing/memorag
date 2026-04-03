@@ -93,6 +93,35 @@ def require_auth(user: Optional[Dict[str, Any]] = Depends(get_current_user)) -> 
 protected = APIRouter(dependencies=[Depends(verify_api_key)])
 
 
+# ── Document-collection routing helpers ───────────────────────────────────
+
+def _make_chat_collection(chat_id: str) -> str:
+    return f"chat_{chat_id[:24]}"
+
+def _make_user_collection(user_id: str) -> str:
+    return f"user_{user_id[:24]}"
+
+def _resolve_collection(chat_id: Optional[str], user_id: Optional[str], default: str) -> str:
+    """Return the most specific collection that actually has documents.
+    Priority: chat-scoped > user-scoped > default fallback.
+    """
+    if chat_id:
+        col = _make_chat_collection(chat_id)
+        try:
+            if state.chroma.collection_stats(col).get("count", 0) > 0:
+                return col
+        except Exception:
+            pass
+    if user_id:
+        col = _make_user_collection(user_id)
+        try:
+            if state.chroma.collection_stats(col).get("count", 0) > 0:
+                return col
+        except Exception:
+            pass
+    return default
+
+
 # ── App state container ────────────────────────────────────────────────────
 
 class AppState:
@@ -120,16 +149,24 @@ async def lifespan(app: FastAPI):
     state.pipeline = RAGIngestionPipeline(settings, state.chroma)
     state.engine = RAGQueryEngine(settings, state.index_manager)
 
-    # Auto-ingest existing documents in data/ on startup
+    # Auto-ingest root-level documents in data/ on startup.
+    # Skip chats/ and users/ subdirs — those are ingested at upload time.
     data_dir = settings.abs(settings.storage.data_dir)
-    if any(data_dir.iterdir()) if data_dir.exists() else False:
-        logger.info("Auto-ingesting existing documents on startup...")
-        result = state.pipeline.ingest_directory(data_dir)
-        state.engine.invalidate_cache(settings.chroma.default_collection)
-        logger.info(
-            f"Startup ingest: {result.files_processed} files, "
-            f"{result.nodes_created} nodes, {result.files_skipped} skipped"
-        )
+    if data_dir.exists():
+        root_files = [
+            f for f in data_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in settings.ingestion.supported_extensions
+        ]
+        if root_files:
+            logger.info(f"Auto-ingesting {len(root_files)} root-level documents on startup...")
+            processed = skipped = nodes = 0
+            for fp in root_files:
+                r = state.pipeline.ingest_file(fp, collection=settings.chroma.default_collection)
+                processed += r.files_processed
+                skipped += r.files_skipped
+                nodes += r.nodes_created
+            state.engine.invalidate_cache(settings.chroma.default_collection)
+            logger.info(f"Startup ingest: {processed} files, {nodes} nodes, {skipped} skipped")
 
     logger.info("RAG API server ready.")
     yield
@@ -258,12 +295,15 @@ async def query(request: QueryRequest):
 
     async def _run():
         try:
+            collection = _resolve_collection(request.chat_id, request.user_id, request.collection)
+            history = [{"role": m.role, "content": m.content} for m in request.chat_history]
             result = await state.engine.aquery(
                 question=request.question,
-                collection=request.collection,
+                collection=collection,
                 top_k=request.top_k,
                 thinking=request.thinking,
                 model=request.model,
+                chat_history=history,
             )
             tasks[task_id]["result"] = QueryResponse(
                 question=result.question,
@@ -302,12 +342,15 @@ async def query_stream(request: QueryRequest):
 
     async def event_generator():
         try:
+            collection = _resolve_collection(request.chat_id, request.user_id, request.collection)
+            history = [{"role": m.role, "content": m.content} for m in request.chat_history]
             async for chunk in state.engine.aquery_stream(
                 question=request.question,
-                collection=request.collection,
+                collection=collection,
                 top_k=request.top_k,
                 thinking=request.thinking,
                 model=request.model,
+                chat_history=history,
             ):
                 yield f"data: {json.dumps(chunk)}\n\n"
         except Exception as exc:
@@ -380,11 +423,15 @@ async def ingest(request: IngestRequest):
 async def upload_document(
     file: UploadFile = File(...),
     collection: str = "documents",
+    scope: str = "global",        # "chat" | "user" | "global"
+    chat_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     background_tasks: BackgroundTasks = None,
 ):
     """
     Upload a document (PDF, TXT, DOCX, MD, CSV).
-    The file is saved to the data directory and ingested automatically.
+    Use scope=chat with chat_id to isolate per-chat docs.
+    Use scope=user with user_id to isolate per-user profile docs.
     """
     allowed = set(settings.ingestion.supported_extensions)
     ext = Path(file.filename).suffix.lower()
@@ -394,18 +441,29 @@ async def upload_document(
             detail=f"Unsupported file type '{ext}'. Allowed: {sorted(allowed)}",
         )
 
-    data_dir = settings.abs(settings.storage.data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    save_path = data_dir / file.filename
+    base_dir = settings.abs(settings.storage.data_dir)
+
+    # Resolve save directory and collection based on scope
+    if scope == "chat" and chat_id:
+        save_dir = base_dir / "chats" / chat_id[:24]
+        collection = _make_chat_collection(chat_id)
+    elif scope == "user" and user_id:
+        save_dir = base_dir / "users" / user_id[:24]
+        collection = _make_user_collection(user_id)
+    else:
+        save_dir = base_dir
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / file.filename
 
     content = await file.read()
     save_path.write_bytes(content)
-    logger.info(f"Uploaded: {file.filename} ({len(content)} bytes)")
+    logger.info(f"Uploaded: {file.filename} ({len(content)} bytes) → collection '{collection}'")
 
     def _ingest():
         r = state.pipeline.ingest_file(save_path, collection=collection, force=True)
         state.engine.invalidate_cache(collection)
-        logger.info(f"Background ingest complete: {r.nodes_created} nodes")
+        logger.info(f"Background ingest complete: {r.nodes_created} nodes → '{collection}'")
 
     if background_tasks:
         background_tasks.add_task(_ingest)
@@ -419,24 +477,44 @@ async def upload_document(
         "filename": file.filename,
         "size_bytes": len(content),
         "collection": collection,
+        "scope": scope,
         "ingest_status": ingest_status,
     }
 
 
 @protected.get("/documents", tags=["Documents"])
-async def list_documents():
-    """List all files currently in the data directory."""
-    data_dir = settings.abs(settings.storage.data_dir)
-    if not data_dir.exists():
+async def list_documents(
+    scope: str = "global",
+    chat_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+):
+    """List documents for a given scope (global / chat / user)."""
+    base_dir = settings.abs(settings.storage.data_dir)
+
+    if scope == "chat" and chat_id:
+        search_dir = base_dir / "chats" / chat_id[:24]
+    elif scope == "user" and user_id:
+        search_dir = base_dir / "users" / user_id[:24]
+    else:
+        # Global: only root-level files (exclude chats/ and users/ subdirs)
+        search_dir = base_dir
+
+    if not search_dir.exists():
         return {"documents": [], "total_count": 0}
 
     files = []
-    for f in data_dir.rglob("*"):
+    if scope == "global":
+        # Only immediate children of data_dir (skip scoped subdirectories)
+        iterator = search_dir.iterdir()
+    else:
+        iterator = search_dir.rglob("*")
+
+    for f in iterator:
         if f.is_file() and f.suffix.lower() in settings.ingestion.supported_extensions:
             stat = f.stat()
             files.append({
                 "filename": f.name,
-                "relative_path": str(f.relative_to(data_dir)),
+                "relative_path": str(f.relative_to(base_dir)),
                 "size_bytes": stat.st_size,
                 "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
                 "extension": f.suffix.lower(),
@@ -449,16 +527,32 @@ async def list_documents():
 
 
 @protected.delete("/documents/{filename}", tags=["Documents"])
-async def delete_document(filename: str, collection: str = "documents"):
-    """Delete a document from the data directory."""
-    data_dir = settings.abs(settings.storage.data_dir)
-    file_path = data_dir / filename
+async def delete_document(
+    filename: str,
+    collection: str = "documents",
+    scope: str = "global",
+    chat_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+):
+    """Delete a document. Scope determines which folder to look in."""
+    base_dir = settings.abs(settings.storage.data_dir)
+
+    if scope == "chat" and chat_id:
+        file_path = base_dir / "chats" / chat_id[:24] / filename
+        collection = _make_chat_collection(chat_id)
+    elif scope == "user" and user_id:
+        file_path = base_dir / "users" / user_id[:24] / filename
+        collection = _make_user_collection(user_id)
+    else:
+        file_path = base_dir / filename
+
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {filename}")
 
     file_path.unlink()
-    logger.info(f"Deleted: {filename}")
-    return {"status": "deleted", "filename": filename}
+    state.engine.invalidate_cache(collection)
+    logger.info(f"Deleted: {filename} (collection={collection})")
+    return {"status": "deleted", "filename": filename, "collection": collection}
 
 
 # ── Collection endpoints ───────────────────────────────────────────────────

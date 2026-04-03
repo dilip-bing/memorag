@@ -11,12 +11,22 @@ class IngestRequest(BaseModel):
     force: bool = Field(False, description="Re-ingest even if file is unchanged")
 
 
+class ChatMessage(BaseModel):
+    """Single message from conversation history."""
+    role: str   # "user" | "assistant"
+    content: str
+
+
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, description="Question to ask")
-    collection: str = Field("documents", description="ChromaDB collection to query")
+    collection: str = Field("documents", description="Fallback ChromaDB collection")
     top_k: Optional[int] = Field(None, description="Override retrieval top_k")
-    thinking: bool = Field(True, description="Enable thinking/reasoning (slower but better). Set false for fast answers.")
-    model: Optional[str] = Field(None, description="Override LLM model (e.g. 'llama3.1:latest')")
+    thinking: bool = Field(True, description="Enable thinking/reasoning mode")
+    model: Optional[str] = Field(None, description="Override LLM model")
+    # Session context
+    chat_id: Optional[str] = Field(None, description="Current chat ID (for per-chat doc lookup)")
+    user_id: Optional[str] = Field(None, description="Current user ID (for profile doc lookup)")
+    chat_history: list[ChatMessage] = Field(default_factory=list, description="Last N messages for context")
 
 
 class CollectionRequest(BaseModel):
