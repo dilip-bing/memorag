@@ -617,6 +617,69 @@ async def list_models():
         raise HTTPException(status_code=502, detail=f"Could not reach Ollama: {exc}")
 
 
+# ── Ephemeral file extraction (per-message attachments) ───────────────────
+
+@protected.post("/documents/extract-text", tags=["Documents"])
+async def extract_text(file: UploadFile = File(...)):
+    """
+    Extract raw text from an uploaded file without storing it in ChromaDB.
+    Used for per-message file attachments (like Claude/GPT 'Add files').
+    The extracted text is sent directly as context in the user's question.
+    Supported: PDF, TXT, MD, CSV, DOCX
+    """
+    import io as _io
+
+    allowed = {'.pdf', '.txt', '.md', '.csv', '.docx'}
+    ext = Path(file.filename).suffix.lower()
+    if ext not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: PDF, TXT, MD, CSV, DOCX",
+        )
+
+    content = await file.read()
+    text = ''
+
+    try:
+        if ext in {'.txt', '.md', '.csv'}:
+            text = content.decode('utf-8', errors='replace')
+
+        elif ext == '.pdf':
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(_io.BytesIO(content))
+                text = '\n'.join(page.extract_text() or '' for page in reader.pages)
+            except ImportError:
+                raise HTTPException(status_code=500, detail="pypdf not installed on server")
+
+        elif ext == '.docx':
+            try:
+                import docx
+                doc = docx.Document(_io.BytesIO(content))
+                text = '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+            except ImportError:
+                raise HTTPException(status_code=500, detail="python-docx not installed on server")
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not extract text: {exc}")
+
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="No text content found in file")
+
+    # Cap to ~50 k chars to stay inside LLM context window
+    MAX_CHARS = 50_000
+    truncated = len(text) > MAX_CHARS
+    return {
+        "filename": file.filename,
+        "text": text[:MAX_CHARS],
+        "char_count": len(text),
+        "truncated": truncated,
+    }
+
+
 # ── Memory endpoints ───────────────────────────────────────────────────────
 
 @protected.post("/memory/extract", tags=["Memory"])
