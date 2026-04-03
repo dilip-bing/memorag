@@ -187,10 +187,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS — allow_credentials must be False when allow_origins=["*"].
+# The app uses X-API-Key and Authorization: Bearer (not cookies), so
+# credentials mode is not needed.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
