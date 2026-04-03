@@ -13,15 +13,16 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Security, Depends
+from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Security, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRouter
 from fastapi.security.api_key import APIKeyHeader
+from pydantic import BaseModel
 
 from rag.config import settings
 from rag.logging_setup import setup_logging
@@ -39,6 +40,7 @@ from rag.models.responses import (
     TaskSubmittedResponse,
     TaskStatusResponse,
 )
+import auth  # Our new auth module
 
 setup_logging(settings)
 logger = logging.getLogger("rag.api")
@@ -53,7 +55,41 @@ async def verify_api_key(key: str = Security(_api_key_header)):
     if configured and key != configured:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-# Protected router — all routes added to this require a valid API key
+
+# ── Google Auth ─────────────────────────────────────────────────────────────
+
+class GoogleAuthRequest(BaseModel):
+    token: str
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    name: str
+    picture: str
+
+
+async def get_current_user(authorization: Optional[str] = Header(None)) -> Optional[Dict[str, Any]]:
+    """Extract and verify user from Authorization header"""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    
+    token = authorization[7:]  # Remove "Bearer " prefix
+    user_info = auth.verify_google_token(token)
+    if not user_info:
+        return None
+    
+    return auth.get_user_by_id(user_info['id'])
+
+
+def require_auth(user: Optional[Dict[str, Any]] = Depends(get_current_user)) -> Dict[str, Any]:
+    """Dependency that requires authentication"""
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+
+# Protected router — all routes require API key only
+# Google auth is a UI gate on the frontend; API key secures the backend
 protected = APIRouter(dependencies=[Depends(verify_api_key)])
 
 
@@ -156,6 +192,43 @@ async def health():
         active_llm=settings.llm.model,
         active_embedding=settings.embedding.model,
     )
+
+
+@app.post("/auth/google", tags=["Auth"])
+async def google_auth(request: GoogleAuthRequest):
+    """
+    Verify a Google ID token and register/update the user in the local DB.
+    Called by the frontend after Google Sign-In.
+    No API key required — this is the initial handshake.
+    """
+    user_info = auth.verify_google_token(request.token)
+    if not user_info:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+
+    user = auth.get_or_create_user(user_info)
+    logger.info(f"User authenticated: {user['email']}")
+
+    return UserResponse(
+        id=user["id"],
+        email=user["email"],
+        name=user["name"],
+        picture=user.get("picture", ""),
+    )
+
+
+@app.get("/auth/me", tags=["Auth"])
+async def get_me(authorization: Optional[str] = Header(None)):
+    """Return the current user from a Google Bearer token (no API key needed)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="No token provided")
+    token = authorization[7:]
+    user_info = auth.verify_google_token(token)
+    if not user_info:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = auth.get_user_by_id(user_info["id"])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found — please sign in first")
+    return UserResponse(**{k: user[k] for k in ["id", "email", "name", "picture"]})
 
 
 @protected.get("/config", tags=["System"])
