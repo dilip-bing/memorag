@@ -323,8 +323,26 @@ app = FastAPI(title="Memora Monitor")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
+def _start_ollama():
+    """Start Ollama in the background if it's not already running."""
+    import shutil
+    ollama_bin = shutil.which("ollama") or r"C:\Users\dilip\AppData\Local\Programs\Ollama\ollama.exe"
+    if not Path(ollama_bin).exists():
+        return
+    # Check if already running
+    for proc in psutil.process_iter(["name"]):
+        if "ollama" in (proc.info["name"] or "").lower():
+            return  # already running
+    subprocess.Popen(
+        [ollama_bin, "serve"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+
 @app.on_event("startup")
 async def on_startup():
+    _start_ollama()
     asyncio.create_task(stats_loop())
 
 @app.websocket("/ws")
