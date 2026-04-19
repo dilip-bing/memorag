@@ -736,7 +736,7 @@ JSON array:""",
             r = await client.post(
                 f"{settings.llm.base_url}/api/chat",
                 json={
-                    "model": settings.llm.model,
+                    "model": "qwen2.5:7b",   # fast small model — ideal for extraction tasks
                     "messages": messages,
                     "stream": False,
                     "think": False,          # suppress thinking for speed
